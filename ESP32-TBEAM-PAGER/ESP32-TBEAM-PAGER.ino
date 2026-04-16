@@ -444,6 +444,8 @@ void saveMessageToFS(const PagerMsg& m) {
                  (unsigned long)m.timestamp);
     }
     // Collision avoidance: two messages in the same second get suffix _a, _b, …
+    // Cap is 26 collisions/second (a..z); after that we overwrite the last file —
+    // in practice POCSAG can't deliver that many messages per second anyway.
     if (SPIFFS.exists(path)) {
         char suf[4] = "_a";
         size_t baseLen = strlen(path) - 4;  // pred ".txt"
@@ -501,6 +503,9 @@ void loadSavedMessages() {
                     lm.ts  = strtoul(line.substring(0, t1).c_str(), nullptr, 10);
                     lm.ric = strtoul(line.substring(t1 + 1, t2).c_str(), nullptr, 10);
                     strlcpy(lm.text, line.substring(t2 + 1).c_str(), MAX_LEN);
+                    // Threshold 1e9 seconds ≈ year 2001 — anything larger is a real
+                    // wall-clock epoch; anything smaller is seconds-since-boot (uptime)
+                    // recorded before the first Skyper time sync.
                     lm.tsIsEpoch = (lm.ts > 1000000000UL);
                     loadedCount++;
                 }
@@ -651,7 +656,9 @@ void drawIdle() {
 void drawAlert(int idx) {
     if (idx >= msgCount) return;
 
-    // Parse sender from message (DAPNET format: "CALL: text")
+    // Parse sender from message (DAPNET format: "CALL: text").
+    // 9-char limit = sender[10] - 1 for null terminator; ham callsigns are ≤7 chars
+    // in practice, so a colon farther in is treated as body punctuation, not a sender.
     char sender[10] = "";
     const char* body = inbox[idx].text;
     const char* colon = strchr(inbox[idx].text, ':');
@@ -932,7 +939,8 @@ void setup() {
     // OLED
     oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
-    // Radio
+    // Radio. POCSAG is 2-FSK modulation (not LoRa), so we take the SX1276 out
+    // of its default LoRa mode and into FSK mode before handing it to PagerClient.
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
     int state = radio.beginFSK();
     if (state != RADIOLIB_ERR_NONE) {
@@ -946,6 +954,8 @@ void setup() {
         while (true) delay(1000);
     }
 
+    // 1200 baud = POCSAG-1200 (a.k.a. POCSAG-2). DAPNET transmits almost exclusively
+    // at this rate; POCSAG-512 and POCSAG-2400 exist but aren't used on DAPNET.
     state = pager.begin(frequency + offset, 1200);
     if (state != RADIOLIB_ERR_NONE) {
         Serial.printf("[Pager] FAIL %d\n", state);
@@ -954,6 +964,8 @@ void setup() {
 
     // Build RIC filter: user RICs from config + TIME_RIC for clock sync.
     // Arrays must be static — RadioLib stores pointers, not copies.
+    // Mask 0xFFFFF = all 20 POCSAG address bits significant → exact-match filter.
+    // A narrower mask would accept prefix/group matches we don't want.
     static uint32_t rxAddrs[CFG_MAX_RICS + 1];
     static uint32_t rxMasks[CFG_MAX_RICS + 1];
     int n = 0;
@@ -981,6 +993,10 @@ void setup() {
 
     // Launch POCSAG reception on Core 0. readData() can block indefinitely
     // when a transmission ends mid-frame, but the UI on Core 1 stays responsive.
+    // Queue depth 4 is plenty: POCSAG batches arrive ~1/sec max and Core 1
+    // drains the queue on every loop() (~100 Hz).
+    // Stack 4096 covers RadioLib's readData() + the Arduino String it returns;
+    // priority 1 matches the default Arduino loopTask.
     rxQueue = xQueueCreate(4, sizeof(RxMsg));
     xTaskCreatePinnedToCore(rxTask, "rx", 4096, nullptr, 1, nullptr, 0);
     // Reconfigure WDT to only watch Core 1's idle task. Core 0's idle task
