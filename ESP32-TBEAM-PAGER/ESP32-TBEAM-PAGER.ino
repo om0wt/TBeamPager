@@ -47,38 +47,58 @@
 #define OLED_SCL    22
 #define BUTTON_USR  38
 #define BUZZER      25
-
-// DAPNET POCSAG carrier frequency (IARU Region 1). Adjust offset per board
-// to compensate SX1276 crystal error — measure with an SDR if unsure.
-float frequency = 439.98750;
-float offset    = 0.0044;
+// Note: the visual alert LED is the AXP2101 CHGLED (red LED below the OLED).
+// It's not on a GPIO — it's controlled by the PMU over I²C via
+// XPowersLib's setChargingLedMode(). T-Beam v1.2 has no free user LED on a GPIO.
 
 // RIC 2504 = DAPNET "Skyper OTA Time" broadcast, sent every ~5 min.
 // Used as the sole time source — no GPS, no NTP, no WiFi.
 #define TIME_RIC    2504
 
 // ─── Config (loaded from /config.json on SPIFFS at boot) ────
-#define CFG_MAX_RICS 8
+#define CFG_MAX_RICS    8
+#define CFG_RIC_NAME_LEN 12   // alias length incl. null terminator; fits status bar header
+
+// One RIC entry from config — number plus optional human-readable alias
+// shown in alert/detail headers and the status bar instead of the raw RIC.
+struct RicEntry {
+    uint32_t ric;
+    char     name[CFG_RIC_NAME_LEN];   // empty string = no alias, fall back to number
+};
 
 struct Config {
-    uint32_t rics[CFG_MAX_RICS];
+    RicEntry rics[CFG_MAX_RICS];
     int      ricCount;
     char     lang[4];            // UI language: "en" | "sk" | "fr" | "es" | "pt"
     bool     storeMessages;
     char     messageFolder[24];
     char     tz[48];             // POSIX TZ string, e.g. "CET-1CEST,M3.5.0/2,M10.5.0/3"
+    float    freq;               // DAPNET carrier in MHz (IARU R1: 439.98750)
+    float    offset;             // per-board crystal correction in MHz
+    bool     buzzer;             // master on/off for piezo alerts
+    int      buzzerVolume;       // 0..100, applied as PWM duty cycle (0 = silent)
+    bool     ledBlink;           // master on/off for LED alert (CHGLED + ext)
+    int      extLedPin;          // optional external LED GPIO; -1 = disabled
+    bool     extLedActiveHigh;   // true = HIGH lights LED (typical wiring to GND)
 };
 
 // Fallback used only if SPIFFS mount fails or /config.json is missing/malformed.
 // Intentionally empty RIC list — do NOT ship a real RIC here, otherwise a
 // misconfigured unit would pick up another ham's traffic on first boot.
 Config cfg = {
-    .rics          = { 0 },
+    .rics          = {},
     .ricCount      = 0,
     .lang          = "en",
     .storeMessages = true,
     .messageFolder = "/msgs",
-    .tz            = "CET-1CEST,M3.5.0/2,M10.5.0/3"
+    .tz            = "CET-1CEST,M3.5.0/2,M10.5.0/3",
+    .freq          = 439.98750f,
+    .offset        = 0.0044f,
+    .buzzer           = true,
+    .buzzerVolume     = 70,
+    .ledBlink         = true,
+    .extLedPin        = -1,
+    .extLedActiveHigh = true
 };
 
 // ─── Messages ───────────────────────────────────────────
@@ -139,6 +159,22 @@ bool rtcValid = false;             // true after first successful Skyper OTA tim
 // it's appended to the previous message instead of creating a new one.
 unsigned long lastMsgTime = 0;
 #define FRAG_WINDOW_MS 5000
+
+// ─── LED alert (PMU-driven + optional external LED) ────
+// Two-stage pager-style alert. Drives two outputs in parallel:
+//   • AXP2101 CHGLED (red, below OLED) — hardware blink via I²C
+//   • optional external LED on cfg.extLedPin — software blink in tickAlertLed
+// State machine:
+//   1. New message → BLINKING for LED_BLINK_MS (4 Hz on both LEDs).
+//   2. Then → STEADY (both LEDs solid on) as persistent "unread" indicator.
+//   3. Detail opened or button pressed → OFF (CHGLED reverts to charging state).
+#define LED_BLINK_MS         3000
+#define LED_BLINK_HALF_MS    125    // ~4 Hz blink (matches PMU's BLINK_4HZ)
+enum LedAlertMode { LED_OFF, LED_BLINKING, LED_STEADY };
+LedAlertMode  ledMode       = LED_OFF;
+unsigned long ledStartedAt  = 0;
+unsigned long ledLastToggle = 0;   // for software-blinking the external LED
+bool          extLedState   = false;
 
 // ─── Auto-scroll for long messages ─────────────────────
 // Messages longer than ~3 lines (30 chars at text size 2) overflow the
@@ -385,35 +421,76 @@ void loadConfig() {
         return;
     }
 
+    // Accept two forms per entry — backward compatible with the original
+    // numeric-only schema, plus an object form that adds a friendly alias:
+    //   "rics": [ 314046, { "ric": 1040, "name": "EMERGENCY" } ]
     JsonArray ra = doc["rics"].as<JsonArray>();
     if (ra) {
         cfg.ricCount = 0;
         for (JsonVariant v : ra) {
             if (cfg.ricCount >= CFG_MAX_RICS) break;
-            cfg.rics[cfg.ricCount++] = v.as<uint32_t>();
+            RicEntry& e = cfg.rics[cfg.ricCount];
+            e.name[0] = '\0';
+            if (v.is<JsonObject>()) {
+                e.ric = v["ric"].as<uint32_t>();
+                if (v["name"].is<const char*>())
+                    strlcpy(e.name, v["name"], sizeof(e.name));
+            } else {
+                e.ric = v.as<uint32_t>();
+            }
+            if (e.ric != 0) cfg.ricCount++;
         }
     }
     if (doc["lang"].is<const char*>())
         strlcpy(cfg.lang, doc["lang"], sizeof(cfg.lang));
-    cfg.storeMessages = doc["storeMessages"] | false;
+    cfg.storeMessages = doc["storeMessages"] | cfg.storeMessages;
     if (doc["messageFolder"].is<const char*>())
         strlcpy(cfg.messageFolder, doc["messageFolder"], sizeof(cfg.messageFolder));
     if (doc["tz"].is<const char*>())
         strlcpy(cfg.tz, doc["tz"], sizeof(cfg.tz));
 
+    // Radio + alert overrides — all optional, fall back to baked-in defaults.
+    cfg.freq         = doc["freq"]         | cfg.freq;
+    cfg.offset       = doc["offset"]       | cfg.offset;
+    cfg.buzzer           = doc["buzzer"]           | cfg.buzzer;
+    cfg.buzzerVolume     = doc["buzzerVolume"]     | cfg.buzzerVolume;
+    cfg.ledBlink         = doc["ledBlink"]         | cfg.ledBlink;
+    cfg.extLedPin        = doc["extLedPin"]        | cfg.extLedPin;
+    cfg.extLedActiveHigh = doc["extLedActiveHigh"] | cfg.extLedActiveHigh;
+    if (cfg.buzzerVolume < 0)   cfg.buzzerVolume = 0;
+    if (cfg.buzzerVolume > 100) cfg.buzzerVolume = 100;
+
     langIdx = langCodeToIdx(cfg.lang);
     resolveTzAlias();
 
-    Serial.printf("[CFG] lang=%s store=%s folder=%s tz=%s rics=",
-                  cfg.lang, cfg.storeMessages ? "y" : "n", cfg.messageFolder, cfg.tz);
-    for (int i = 0; i < cfg.ricCount; i++)
-        Serial.printf("%lu%s", cfg.rics[i], i + 1 < cfg.ricCount ? "," : "\n");
+    Serial.printf("[CFG] lang=%s store=%s folder=%s tz=%s freq=%.4f off=%.4f buz=%s vol=%d led=%s extLed=%d/%s rics=",
+                  cfg.lang, cfg.storeMessages ? "y" : "n", cfg.messageFolder, cfg.tz,
+                  cfg.freq, cfg.offset,
+                  cfg.buzzer ? "y" : "n", cfg.buzzerVolume,
+                  cfg.ledBlink ? "y" : "n",
+                  cfg.extLedPin, cfg.extLedActiveHigh ? "AH" : "AL");
+    for (int i = 0; i < cfg.ricCount; i++) {
+        if (cfg.rics[i].name[0])
+            Serial.printf("%lu(%s)", (unsigned long)cfg.rics[i].ric, cfg.rics[i].name);
+        else
+            Serial.printf("%lu", (unsigned long)cfg.rics[i].ric);
+        Serial.print(i + 1 < cfg.ricCount ? "," : "\n");
+    }
 }
 
 bool addrIsUserRic(uint32_t addr) {
     for (int i = 0; i < cfg.ricCount; i++)
-        if (cfg.rics[i] == addr) return true;
+        if (cfg.rics[i].ric == addr) return true;
     return false;
+}
+
+// Returns the user-defined alias for a RIC, or nullptr if none/unknown.
+// Caller decides the fallback (usually printing the raw number).
+const char* ricNameFor(uint32_t addr) {
+    for (int i = 0; i < cfg.ricCount; i++)
+        if (cfg.rics[i].ric == addr && cfg.rics[i].name[0])
+            return cfg.rics[i].name;
+    return nullptr;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -588,15 +665,20 @@ void drawMiniBar() {
         snprintf(b, sizeof(b), "%d %s", ur, T(STR_NEW));
         oled.print(b);
     } else {
-        // "439.988 1234567[+]" — frequency + primary RIC (+ if more configured)
+        // "439.988 ALIAS[+]" or "439.988 1234567[+]" — frequency + primary RIC.
+        // Alias preferred when set (saves space, more readable than raw number).
         char top[24];
         if (cfg.ricCount > 0) {
-            snprintf(top, sizeof(top), "%.3f %lu%s",
-                     frequency,
-                     (unsigned long)cfg.rics[0],
-                     cfg.ricCount > 1 ? "+" : "");
+            const char* tail = cfg.ricCount > 1 ? "+" : "";
+            if (cfg.rics[0].name[0]) {
+                snprintf(top, sizeof(top), "%.3f %s%s",
+                         cfg.freq, cfg.rics[0].name, tail);
+            } else {
+                snprintf(top, sizeof(top), "%.3f %lu%s",
+                         cfg.freq, (unsigned long)cfg.rics[0].ric, tail);
+            }
         } else {
-            snprintf(top, sizeof(top), "%.3f", frequency);
+            snprintf(top, sizeof(top), "%.3f", cfg.freq);
         }
         oled.print(top);
     }
@@ -701,9 +783,14 @@ void drawAlert(int idx) {
     if (strlen(sender) > 0) {
         oled.print(sender);
     } else {
-        char ric[12];
-        snprintf(ric, sizeof(ric), "%lu", inbox[idx].addr);
-        oled.print(ric);
+        const char* alias = ricNameFor(inbox[idx].addr);
+        if (alias) {
+            oled.print(alias);
+        } else {
+            char ric[12];
+            snprintf(ric, sizeof(ric), "%lu", inbox[idx].addr);
+            oled.print(ric);
+        }
     }
     char ts[8];
     formatClock(ts, sizeof(ts));
@@ -787,6 +874,7 @@ void drawInbox() {
 void drawDetail(int idx) {
     if (idx >= msgCount) return;
     inbox[idx].unread = false;
+    stopAlertLed();   // message is now considered read
 
     // Parse sender
     char sender[10] = "";
@@ -828,9 +916,14 @@ void drawDetail(int idx) {
     if (strlen(sender) > 0) {
         oled.print(sender);
     } else {
-        char ric[12];
-        snprintf(ric, sizeof(ric), "%lu", inbox[idx].addr);
-        oled.print(ric);
+        const char* alias = ricNameFor(inbox[idx].addr);
+        if (alias) {
+            oled.print(alias);
+        } else {
+            char ric[12];
+            snprintf(ric, sizeof(ric), "%lu", inbox[idx].addr);
+            oled.print(ric);
+        }
     }
     char info[16];
     char age[8];
@@ -843,15 +936,172 @@ void drawDetail(int idx) {
     oled.display();
 }
 
-// ─── Buzzer ─────────────────────────────────────────────
-void beepAlert() {
-    for (int i = 0; i < 3; i++) {
-        tone(BUZZER, 2730, 100);
-        delay(130);
-        tone(BUZZER, 3200, 100);
-        delay(130);
+// ── DAPNET splash bitmap (128×64, 1bpp) ──
+// Sourced from the original ON6RF firmware
+// (https://github.com/ManoDaSilva/ESP32-Pocsag-Pager — main.cpp `displayLogo[]`).
+// 1024 B in PROGMEM. Drawn once on boot to identify the network the pager rides on.
+static const uint8_t dapnetLogo[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x03, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x07, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x07, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0xe1, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0xc0, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x80, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x80, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x80, 0xf8, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0xc0, 0xf8, 0x00, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0xe1, 0xfc, 0x01, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x07, 0xff, 0xff, 0x07, 0xff, 0xf8, 0x0f, 0xe0, 0x1c, 0x1f, 0xc3, 0x03, 0x3f, 0xef, 0xfc,
+    0x00, 0x07, 0xff, 0xff, 0x8f, 0xff, 0xfc, 0x0f, 0xf8, 0x1c, 0x1f, 0xe3, 0x83, 0x3f, 0xef, 0xfc,
+    0x00, 0x03, 0xff, 0xef, 0xff, 0xf3, 0xfe, 0x0c, 0x18, 0x36, 0x18, 0x73, 0xc3, 0x30, 0x00, 0xc0,
+    0x00, 0x01, 0xff, 0xc7, 0xff, 0xc0, 0xfe, 0x0c, 0x0c, 0x36, 0x18, 0x33, 0xc3, 0x30, 0x00, 0xc0,
+    0x00, 0x00, 0x7f, 0x01, 0xff, 0x00, 0x3e, 0x0c, 0x0c, 0x36, 0x18, 0x73, 0x63, 0x30, 0x00, 0xc0,
+    0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x3f, 0x0c, 0x0c, 0x63, 0x1f, 0xe3, 0x33, 0x3f, 0xe0, 0xc0,
+    0x00, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x3f, 0x0c, 0x0c, 0x63, 0x1f, 0xc3, 0x33, 0x3f, 0xe0, 0xc0,
+    0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x1f, 0x8c, 0x0c, 0x7f, 0x18, 0x03, 0x1b, 0x30, 0x00, 0xc0,
+    0x00, 0x00, 0xe0, 0x00, 0x7c, 0x00, 0x0f, 0x8c, 0x0c, 0xff, 0x98, 0x03, 0x0f, 0x30, 0x00, 0xc0,
+    0x00, 0x0f, 0xfe, 0x00, 0x7c, 0x00, 0x0f, 0x8c, 0x18, 0xc1, 0x98, 0x03, 0x0f, 0x30, 0x00, 0xc0,
+    0x00, 0x3f, 0xfe, 0x00, 0x7c, 0x00, 0x0f, 0x8f, 0xf8, 0xc1, 0x98, 0x03, 0x07, 0x3f, 0xe0, 0xc0,
+    0x00, 0x7f, 0xff, 0xc0, 0x7c, 0x00, 0x1f, 0x8f, 0xe1, 0x80, 0xd8, 0x03, 0x03, 0x3f, 0xe0, 0xc0,
+    0x00, 0xff, 0xff, 0xe0, 0x3e, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0xff, 0x1f, 0xf1, 0xfe, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0xf8, 0x07, 0xff, 0xff, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0xf0, 0x01, 0xff, 0xff, 0x80, 0x7e, 0x3e, 0x1c, 0x1e, 0x7d, 0xf0, 0x00, 0xc6, 0x70, 0x18,
+    0x0f, 0xe0, 0x00, 0xff, 0xff, 0xe1, 0xfe, 0x33, 0x1c, 0x33, 0x61, 0x98, 0x00, 0xc6, 0xd8, 0x38,
+    0x0f, 0xc0, 0x00, 0xff, 0xdf, 0xff, 0xfe, 0x33, 0x36, 0x60, 0x61, 0x98, 0x00, 0x6c, 0xd8, 0x78,
+    0x0f, 0x80, 0x00, 0x7e, 0x07, 0xff, 0xf8, 0x33, 0x36, 0x60, 0x7d, 0x98, 0x00, 0x6c, 0xd8, 0x58,
+    0x0f, 0x80, 0x00, 0x3e, 0x03, 0xff, 0xf0, 0x3e, 0x36, 0x67, 0x61, 0xf0, 0x00, 0x6c, 0xd8, 0x18,
+    0x1f, 0x00, 0x00, 0x3e, 0x00, 0xff, 0xc0, 0x30, 0x7f, 0x63, 0x61, 0xb0, 0x70, 0x6c, 0xd8, 0x18,
+    0x0f, 0x00, 0x00, 0x3e, 0x00, 0x3f, 0x00, 0x30, 0x63, 0x33, 0x61, 0x98, 0x00, 0x38, 0xdb, 0x18,
+    0x1f, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x30, 0x63, 0x1e, 0x7d, 0x8c, 0x00, 0x38, 0x73, 0x18,
+    0x1f, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1f, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x80, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x80, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x80, 0x00, 0x7c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0xc0, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0xe0, 0x01, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0xf0, 0x07, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0xfc, 0x1f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x7f, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x3f, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+// ── SPLASH: shown for ~1.5 s right after OLED init, before the radio comes up ──
+void drawSplash() {
+    oled.clearDisplay();
+    oled.drawBitmap(0, 0, dapnetLogo, 128, 64, SSD1306_WHITE);
+    oled.display();
+}
+
+// ─── Alert LED ──────────────────────────────────────────
+// Writes the external LED with the configured polarity. No-op if no
+// external LED is wired (extLedPin < 0). Updates extLedState for the
+// software-blink toggle in tickAlertLed().
+void extLedWrite(bool on) {
+    if (cfg.extLedPin < 0) return;
+    bool level = cfg.extLedActiveHigh ? on : !on;
+    digitalWrite(cfg.extLedPin, level ? HIGH : LOW);
+    extLedState = on;
+}
+
+void startAlertLed() {
+    if (!cfg.ledBlink) return;
+    ledMode       = LED_BLINKING;
+    ledStartedAt  = millis();
+    ledLastToggle = millis();
+    pmu.setChargingLedMode(XPOWERS_CHG_LED_BLINK_4HZ);
+    extLedWrite(true);   // first half-cycle of the blink
+}
+
+// Called when the message is read (detail opened) or acknowledged (button press).
+// We force the CHGLED OFF (not CTRL_CHG) so it doesn't keep glowing as a
+// charging indicator while plugged in — that looks identical to a stuck
+// alert from the user's POV. Charge status is visible on the OLED instead.
+void stopAlertLed() {
+    if (ledMode == LED_OFF) return;   // skip needless I²C writes
+    ledMode = LED_OFF;
+    pmu.setChargingLedMode(XPOWERS_CHG_LED_OFF);
+    extLedWrite(false);
+}
+
+// Called from loop() every iteration. Cheap when LED_OFF.
+// PMU does its own blinking; we only need to toggle the external LED here
+// and detect the BLINKING → STEADY transition.
+void tickAlertLed() {
+    if (ledMode == LED_OFF) return;
+    unsigned long now = millis();
+
+    if (ledMode == LED_BLINKING) {
+        if (now - ledStartedAt >= LED_BLINK_MS) {
+            ledMode = LED_STEADY;
+            pmu.setChargingLedMode(XPOWERS_CHG_LED_ON);
+            extLedWrite(true);   // pin held HIGH for the steady "unread" signal
+            return;
+        }
+        if (cfg.extLedPin >= 0 && now - ledLastToggle >= LED_BLINK_HALF_MS) {
+            extLedWrite(!extLedState);
+            ledLastToggle = now;
+        }
     }
-    noTone(BUZZER);
+    // LED_STEADY: nothing to do — both LEDs already solid on.
+}
+
+// ─── Buzzer ─────────────────────────────────────────────
+// Plays a tone for `ms` milliseconds, blocking. Volume comes from
+// cfg.buzzerVolume (0..100), implemented as PWM duty cycle on the LEDC
+// peripheral — ~50% duty (max for a square wave) maps to volume 100.
+// Returns immediately if the buzzer is disabled in config (no audible
+// output AND no time wasted on blocking delays).
+void playTone(uint16_t freq, uint16_t ms) {
+    if (!cfg.buzzer || cfg.buzzerVolume <= 0 || freq == 0 || ms == 0) return;
+    uint8_t duty = (cfg.buzzerVolume * 128) / 100;   // cap at 128/256 = 50% (square-wave max)
+    if (duty < 1) duty = 1;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttach(BUZZER, freq, 8);
+    ledcWrite(BUZZER, duty);
+    delay(ms);
+    ledcWrite(BUZZER, 0);
+    ledcDetach(BUZZER);
+#else
+    ledcSetup(0, freq, 8);
+    ledcAttachPin(BUZZER, 0);
+    ledcWrite(0, duty);
+    delay(ms);
+    ledcWrite(0, 0);
+    ledcDetachPin(BUZZER);
+#endif
+}
+
+void beepAlert() {
+    if (!cfg.buzzer || cfg.buzzerVolume <= 0) return;
+    for (int i = 0; i < 3; i++) {
+        playTone(2730, 100);
+        delay(30);
+        playTone(3200, 100);
+        delay(30);
+    }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -937,10 +1187,27 @@ void setup() {
     pmu.setPrechargeCurr(XPOWERS_AXP2101_PRECHARGE_200MA);
     pmu.setChargerTerminationCurr(XPOWERS_AXP2101_CHG_ITERM_25MA);
 
+    // CHGLED reserved for alert use only — kill the default charging-state
+    // indicator so a plugged-in device doesn't look like it has a stuck alert.
+    pmu.setChargingLedMode(XPOWERS_CHG_LED_OFF);
+
+    // Optional external alert LED — opt-in via cfg.extLedPin (-1 = disabled).
+    if (cfg.extLedPin >= 0) {
+        pinMode(cfg.extLedPin, OUTPUT);
+        extLedWrite(false);
+    }
+
     delay(100);
 
     // OLED
     oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+    // Boot splash — stays up while radio init runs below; the brief delay
+    // also gives the SSD1306 panel time to settle after first power-on.
+    drawSplash();
+    oledOn = true;
+    lastActivity = millis();
+    delay(1500);
 
     // Radio. POCSAG is 2-FSK modulation (not LoRa), so we take the SX1276 out
     // of its default LoRa mode and into FSK mode before handing it to PagerClient.
@@ -959,7 +1226,7 @@ void setup() {
 
     // 1200 baud = POCSAG-1200 (a.k.a. POCSAG-2). DAPNET transmits almost exclusively
     // at this rate; POCSAG-512 and POCSAG-2400 exist but aren't used on DAPNET.
-    state = pager.begin(frequency + offset, 1200);
+    state = pager.begin(cfg.freq + cfg.offset, 1200);
     if (state != RADIOLIB_ERR_NONE) {
         Serial.printf("[Pager] FAIL %d\n", state);
         while (true) delay(1000);
@@ -973,7 +1240,7 @@ void setup() {
     static uint32_t rxMasks[CFG_MAX_RICS + 1];
     int n = 0;
     for (int i = 0; i < cfg.ricCount && n < CFG_MAX_RICS; i++) {
-        rxAddrs[n] = cfg.rics[i];
+        rxAddrs[n] = cfg.rics[i].ric;
         rxMasks[n] = 0xFFFFF;
         n++;
     }
@@ -986,13 +1253,11 @@ void setup() {
         while (true) delay(1000);
     }
 
-    Serial.printf("[OK] %d RICs + time @ %.4f MHz\n", cfg.ricCount, frequency + offset);
+    Serial.printf("[OK] %d RICs + time @ %.4f MHz\n", cfg.ricCount, cfg.freq + cfg.offset);
 
-    tone(BUZZER, 2000, 100);
-    delay(150);
-    tone(BUZZER, 3000, 100);
-    delay(100);
-    noTone(BUZZER);
+    playTone(2000, 100);
+    delay(50);
+    playTone(3000, 100);
 
     // Launch POCSAG reception on Core 0. readData() can block indefinitely
     // when a transmission ends mid-frame, but the UI on Core 1 stays responsive.
@@ -1050,7 +1315,8 @@ void loop() {
                 }
             } else {
                 storeMessage(rx.addr, rx.text);
-                beepAlert();  // only beep on first fragment
+                beepAlert();      // only beep on first fragment
+                startAlertLed();  // visual cue in case the buzzer is missed
             }
             lastMsgTime = millis();
             wakeOLED();
@@ -1064,9 +1330,10 @@ void loop() {
     bool btnDown = (digitalRead(BUTTON_USR) == LOW);
 
     if (btnDown && !btnWasDown) {
-        // Button just pressed
+        // Button just pressed — acknowledges any pending alert blink
         btnDownTime = millis();
         btnWasDown = true;
+        stopAlertLed();
     }
 
     if (!btnDown && btnWasDown) {
@@ -1165,6 +1432,8 @@ void loop() {
         millis() - lastActivity > 10000) {
         sleepOLED();
     }
+
+    tickAlertLed();
 
     delay(10);  // ~100 Hz polling rate for button + queue
 }

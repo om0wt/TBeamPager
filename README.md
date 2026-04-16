@@ -34,6 +34,16 @@ with auto-scroll for long messages.
   on boot. Optional CR1220 coin cell keeps time through full power-off.
 - 🔔 **Big-font alerts + piezo beep** on every personal RIC message; alert
   screen stays lit until user acknowledges.
+- 💡 **LED unread indicator** — AXP2101 CHGLED (small LED below OLED) blinks
+  at 4 Hz for 3 s on a new message, then stays steady-on as a persistent
+  "unread" signal until the message is opened (detail view) or any button
+  is pressed. Hardware blink, no CPU cost.
+- 🔌 **Optional external alert LED** — wire any LED to a free GPIO and
+  set `extLedPin` in `config.json`; firmware drives it in sync with the
+  on-board CHGLED. Polarity is configurable (`extLedActiveHigh`).
+- 🔇 **Configurable buzzer + LED** — both can be muted independently from
+  `config.json` (`buzzer`, `buzzerVolume` 0-100, `ledBlink`); RX
+  frequency + per-board crystal `offset` are also config-driven.
 - 📜 **Auto-scroll for long messages** — smooth pixel-by-pixel vertical scroll
   with pause at top/bottom.
 - 🗂 **Persistent inbox** — last 20 messages kept in SPIFFS across reboots,
@@ -374,6 +384,24 @@ update the clock and nothing else. After 60 seconds of no activity
 (and not currently showing an alert), the framebuffer is blanked —
 there's no hardware sleep, just `display()` with an empty buffer.
 
+Alongside the buzzer, the **AXP2101 CHGLED** (a small red/blue LED
+below the OLED — color varies by board batch) runs a two-stage
+pager-style alert: ~3 s of hardware blink at 4 Hz to grab attention,
+then **steady-on** as a persistent "unread" indicator. Reading the
+message (`SCR_DETAIL`) or any button press stops the alert and forces
+the LED **off** — we deliberately don't fall back to the default
+charging-state indicator, because a charging device would otherwise
+look identical to a stuck alert. Charge state is visible on the OLED
+battery readout instead.
+
+T-Beam v1.2 has no free GPIO-controlled user LED, so the CHGLED is
+the on-board primitive for alerts. If you want a second, more visible
+indicator (different color, mounted somewhere obvious), wire one to a
+free GPIO + 330 Ω resistor and set `extLedPin` in config — the
+firmware will blink/steady it in sync with the CHGLED. Note: the
+small power LED that sits next to the CHGLED on most v1.2 boards is
+hardwired to the 3v3 rail and **cannot** be turned off in software.
+
 The top status bar shows the RX frequency + the primary user RIC
 (`439.988 1234567`) plus battery percent; when there are unread messages
 the frequency block is replaced with `N new`.
@@ -396,21 +424,44 @@ languages.
 
 ```json
 {
-  "rics":          [1234567],
+  "rics": [
+    { "ric": 1234567, "name": "Me" },
+    7654321
+  ],
   "lang":          "en",
   "storeMessages": true,
   "messageFolder": "/msgs",
-  "tz":            "Europe/Bratislava"
+  "tz":            "Europe/Bratislava",
+  "freq":          439.98750,
+  "offset":        0.0044,
+  "buzzer":        true,
+  "buzzerVolume":  70,
+  "ledBlink":      true,
+  "extLedPin":     -1,
+  "extLedActiveHigh": true
 }
 ```
 
+> The two RIC values above (`1234567` and `7654321`) are **placeholders** — they
+> are not real DAPNET addresses. Replace them with your own DAPNET RIC(s).
+> The example shows both supported entry forms: an object with a friendly
+> `name` (shown in the UI), and a bare number (no alias — UI falls back to
+> printing the raw RIC).
+
 | Key             | Meaning                                                                 |
 |-----------------|-------------------------------------------------------------------------|
-| `rics`          | JSON array of up to 8 numeric RIC addresses this pager should match.    |
+| `rics`          | JSON array of up to 8 entries. Each entry is either a bare number (`1080`) or an object `{ "ric": 1234567, "name": "Me" }`. The optional `name` (≤11 chars) is shown in the status bar and as the sender on incoming alerts when the message itself doesn't carry a callsign. |
 | `lang`          | UI language: `en`, `sk`, `fr`, `es`, `pt` (ASCII-only, no diacritics).  |
 | `storeMessages` | `true` → persist every received message to SPIFFS; `false` → RAM only.  |
 | `messageFolder` | Path prefix for stored messages. Default `/msgs`.                       |
 | `tz`            | Timezone — either a human-readable alias (resolved via `data/tz.csv`) or a raw POSIX TZ string. See below. |
+| `freq`          | DAPNET carrier frequency in MHz. Default `439.98750` (IARU R1). Override only if your local DAPNET allocation differs. |
+| `offset`        | Per-board crystal correction in MHz. Default `0.0044`. Tweak with an SDR if RX is unreliable — the SX1276's TCXO drift varies between units. |
+| `buzzer`        | `true` → play piezo on new messages and at boot; `false` → fully silent. |
+| `buzzerVolume`  | `0`–`100`. Implemented as PWM duty cycle on the LEDC peripheral (0 = off, 100 = max ~50% duty). `0` is equivalent to `buzzer:false`. |
+| `ledBlink`      | `true` → fire the AXP2101 CHGLED on new messages (3 s blink → steady-on until read); `false` → keep the LED off entirely. |
+| `extLedPin`     | GPIO of an optional **external** alert LED. `-1` (default) = no external LED. Wire LED + series resistor (~330 Ω) from the GPIO to GND. Safe pins on T-Beam v1.2: `13`, `14`, `4`. Avoid bootstrap pins (`0`, `2`, `12`, `15`) and pins already used by the radio/PMU/buzzer/button. |
+| `extLedActiveHigh` | Polarity of the external LED. `true` (default) = HIGH lights it (typical wiring with LED to GND). `false` = LOW lights it (use when wired to VCC instead). |
 
 **Timezone resolution:** on boot, `resolveTzAlias()` reads `/tz.csv` from
 SPIFFS line by line, looking for a match on the `tz` value from config.

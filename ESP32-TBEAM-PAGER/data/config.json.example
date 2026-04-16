@@ -1,7 +1,17 @@
 {
-  "rics": [1234567],
+  "rics": [
+    { "ric": 1234567, "name": "Me" },
+    7654321
+  ],
   "lang": "en",
   "storeMessages": true,
   "messageFolder": "/msgs",
-  "tz": "Europe/Bratislava"
+  "tz": "Europe/Bratislava",
+  "freq": 439.98750,
+  "offset": 0.0044,
+  "buzzer": true,
+  "buzzerVolume": 70,
+  "ledBlink": true,
+  "extLedPin": -1,
+  "extLedActiveHigh": true
 }
