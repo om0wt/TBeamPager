@@ -107,6 +107,8 @@ bool btnWasDown = false;
 float batVoltage = 0;
 int batPercent   = 0;
 bool rtcValid = false;       // true po prvom Skyper OTA Time sync
+unsigned long lastMsgTime = 0;
+#define FRAG_WINDOW_MS 5000
 
 // ─── Auto-scroll for long messages ─────────────────────
 #define BODY_TOP        10
@@ -943,10 +945,23 @@ void loop() {
             tryParseSkyperTime(rx.text);
             if (rtcValid && screen == SCR_IDLE && oledOn) drawIdle();
         } else if (addrIsUserRic(rx.addr)) {
-            storeMessage(rx.addr, rx.text);
+            bool isContinuation = (msgCount > 0 &&
+                                   inbox[0].addr == rx.addr &&
+                                   millis() - lastMsgTime < FRAG_WINDOW_MS);
+            if (isContinuation) {
+                int existing = strlen(inbox[0].text);
+                if (existing < MAX_LEN - 1) {
+                    strlcpy(inbox[0].text + existing, rx.text, MAX_LEN - existing);
+                    saveMessageToFS(inbox[0]);
+                    Serial.printf("[FRAG] appended → %d chars\n", (int)strlen(inbox[0].text));
+                }
+            } else {
+                storeMessage(rx.addr, rx.text);
+                beepAlert();
+            }
+            lastMsgTime = millis();
             wakeOLED();
             drawAlert(0);
-            beepAlert();
             lastActivity = millis();
             screen = SCR_ALERT;
         }

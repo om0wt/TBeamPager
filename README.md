@@ -242,6 +242,16 @@ All radio access (`pager.available()`, `pager.readData()`) happens
 exclusively inside `rxTask` on Core 0. The main loop on Core 1 never
 touches SPI or the radio object directly.
 
+**Fragment reassembly:** RadioLib's `readData()` returns only one POCSAG
+batch at a time (~40–50 characters). Messages longer than one batch are
+delivered as multiple consecutive fragments with the same RIC address.
+The firmware detects this: when a new fragment arrives from the **same
+RIC within 5 seconds** (`FRAG_WINDOW_MS`) of the previous one, it is
+appended to the existing inbox entry instead of creating a new message.
+Only the first fragment triggers the piezo alert; continuations silently
+update the displayed text. Serial log shows `[FRAG] appended → N chars`
+when reassembly occurs.
+
 ### 3.4 Time-of-day sync + RTC persistence
 
 WiFi is off and the GPS is powered down, so on a fresh cold boot the
@@ -511,6 +521,7 @@ If the gateway logs the message but the T-Beam doesn't beep:
 | `[RX]`      | `PagerClient::startReceive()` result                    |
 | `[RTC]`     | Time sync from Skyper OTA / restored from SPIFFS/RTC    |
 | `>>> RIC:…` | Raw reception: matched RIC + text (from Core 0 queue)   |
+| `[FRAG]`    | Fragment appended to previous message (same RIC < 5 s)  |
 | `[OK]`      | Startup summary + "rxTask on Core 0, UI on Core 1"     |
 
 ---
@@ -540,6 +551,24 @@ If the gateway logs the message but the T-Beam doesn't beep:
   the next clock transition that never comes. The dual-core architecture
   confines this blocking to Core 0 — the UI stays responsive, but the
   affected incomplete frame is lost. Complete messages are not affected.
+- **Message length limited to ~50–55 characters.** This is a RadioLib /
+  POCSAG protocol limitation, not a firmware bug. POCSAG encodes 7-bit
+  characters into 20-bit codewords grouped into batches of 16. The
+  address codeword's frame position (RIC % 8) determines how many data
+  codewords fit in the first batch; combined with the second batch this
+  yields roughly 50–55 usable characters. RadioLib's `readData()` does
+  not reliably decode a third batch — any overflow is silently lost.
+  The firmware includes fragment reassembly (concatenates pieces from the
+  same RIC arriving within 5 seconds), but in practice the third batch
+  data never reaches the decoder. **Keep DAPNET personal messages under
+  ~50 characters for reliable delivery.** Possible future solutions:
+  - Upgrade to a newer RadioLib release that may improve multi-batch
+    POCSAG decoding.
+  - Fork RadioLib and fix `PagerClient::readData()` to follow the data
+    stream across batch boundaries without stopping at idle codewords.
+  - Switch to an SX1262-based board (T-Beam Supreme) — the SX1262 has a
+    larger FIFO and different DIO handling that may help RadioLib capture
+    more data per `readData()` call.
 - **Inbox capped at 20 messages in RAM / on SPIFFS.** The oldest get
   evicted first. Raising `MAX_MSGS` is easy but `loadSavedMessages()`
   uses a `static`-allocated buffer sized `MAX_MSGS * 2` (~8.5 KB in BSS)
