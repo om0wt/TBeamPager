@@ -2,5 +2,6 @@
   "rics": [1234567],
   "lang": "en",
   "storeMessages": true,
-  "messageFolder": "/msgs"
+  "messageFolder": "/msgs",
+  "tz": "Europe/Bratislava"
 }

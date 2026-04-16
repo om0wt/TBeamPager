@@ -20,6 +20,7 @@
 #include <sys/time.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
 #define LORA_SCK    5
 #define LORA_MISO   19
@@ -47,6 +48,7 @@ struct Config {
     char     lang[4];            // "en" | "sk" | "fr" | "es" | "pt"
     bool     storeMessages;
     char     messageFolder[24];
+    char     tz[48];             // POSIX TZ string, e.g. "CET-1CEST,M3.5.0/2,M10.5.0/3"
 };
 
 Config cfg = {
@@ -54,8 +56,26 @@ Config cfg = {
     .ricCount      = 1,
     .lang          = "en",
     .storeMessages = true,
-    .messageFolder = "/msgs"
+    .messageFolder = "/msgs",
+    .tz            = "CET-1CEST,M3.5.0/2,M10.5.0/3"
 };
+
+// ─── Messages ───────────────────────────────────────────
+#define MAX_MSGS   20
+#define MAX_LEN    200
+
+struct PagerMsg {
+    uint32_t addr;
+    char     text[MAX_LEN];
+    uint32_t timestamp;      // epoch seconds (wall clock) alebo millis()/1000 uptime
+    bool     tsIsEpoch;      // true → timestamp je reálny čas, false → uptime
+    bool     unread;
+};
+
+PagerMsg inbox[MAX_MSGS];
+int msgCount  = 0;
+int totalMsgs = 0;
+int viewIdx   = 0;
 
 // ─── Translations ───────────────────────────────────────
 enum Lang  { LANG_EN, LANG_SK, LANG_FR, LANG_ES, LANG_PT, LANG_COUNT };
@@ -76,23 +96,6 @@ static const char* translations[LANG_COUNT][STR_COUNT] = {
 int langIdx = LANG_EN;
 const char* T(StrId k) { return translations[langIdx][k]; }
 
-// ─── Messages ───────────────────────────────────────────
-#define MAX_MSGS   20
-#define MAX_LEN    200
-
-struct PagerMsg {
-    uint32_t addr;
-    char     text[MAX_LEN];
-    uint32_t timestamp;      // epoch seconds (wall clock) alebo millis()/1000 uptime
-    bool     tsIsEpoch;      // true → timestamp je reálny čas, false → uptime
-    bool     unread;
-};
-
-PagerMsg inbox[MAX_MSGS];
-int msgCount  = 0;
-int totalMsgs = 0;
-int viewIdx   = 0;
-
 // ─── UI ─────────────────────────────────────────────────
 enum Screen { SCR_IDLE, SCR_ALERT, SCR_INBOX, SCR_DETAIL };
 Screen screen = SCR_IDLE;
@@ -105,11 +108,46 @@ float batVoltage = 0;
 int batPercent   = 0;
 bool rtcValid = false;       // true po prvom Skyper OTA Time sync
 
+// ─── Auto-scroll for long messages ─────────────────────
+#define BODY_TOP        10
+#define BODY_H          (64 - BODY_TOP)
+#define SCROLL_STEP_MS  80
+#define SCROLL_PAUSE_MS 2000
+int  scrollY     = 0;
+int  scrollMax   = 0;
+int  scrollState = 0;        // 0=pause_top, 1=scrolling, 2=pause_bottom
+unsigned long scrollTimer = 0;
+bool scrollInProgress = false;
+
 // ─── Objects ────────────────────────────────────────────
 SX1276 radio = new Module(LORA_SS, LORA_DIO0, LORA_RST, LORA_DIO1);
 PagerClient pager(&radio);
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 XPowersAXP2101 pmu;
+
+// ─── Core 0 RX task + queue ────────────────────────────
+struct RxMsg {
+    uint32_t addr;
+    char     text[MAX_LEN];
+};
+QueueHandle_t rxQueue = nullptr;
+
+void rxTask(void* param) {
+    for (;;) {
+        if (pager.available() >= 2) {
+            String str;
+            uint32_t addr = 0;
+            int state = pager.readData(str, 0, &addr);
+            if (state == RADIOLIB_ERR_NONE) {
+                RxMsg msg;
+                msg.addr = addr;
+                strlcpy(msg.text, str.c_str(), MAX_LEN);
+                xQueueSend(rxQueue, &msg, portMAX_DELAY);
+            }
+        }
+        vTaskDelay(1);
+    }
+}
 
 // ═══════════════════════════════════════════════════════
 //  HELPERS
@@ -188,10 +226,12 @@ void setTimeFromSkyper(int hh, int mm, int ss, int dd, int mo, int yy) {
     struct timeval tv = { .tv_sec = utc, .tv_usec = 0 };
     settimeofday(&tv, NULL);
     // Slovensko: CET (+1) / CEST (+2), auto DST podla POSIX TZ stringu
-    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+    setenv("TZ", cfg.tz, 1);
     tzset();
     rtcValid = true;
-    Serial.printf("[RTC] Sync: 20%02d-%02d-%02d %02d:%02d:%02d UTC\n",
+    File tf = SPIFFS.open("/rtc.txt", "w");
+    if (tf) { tf.println(utc); tf.close(); }
+    Serial.printf("[RTC] Sync: 20%02d-%02d-%02d %02d:%02d:%02d UTC → saved\n",
                   yy, mo, dd, hh, mm, ss);
 }
 
@@ -204,6 +244,23 @@ bool tryParseSkyperTime(const char* text) {
     if (sscanf(p, "%2d%2d%2d %2d%2d%2d", &hh, &mm, &ss, &dd, &mo, &yy) == 6) {
         if (hh < 24 && mm < 60 && ss < 60 &&
             dd >= 1 && dd <= 31 && mo >= 1 && mo <= 12) {
+            if (rtcValid) {
+                // Porovnaj s aktualnym casom — aktualizuj len ak rozdiel > 60 s
+                setenv("TZ", "UTC0", 1); tzset();
+                struct tm t = {};
+                t.tm_year = 2000 + yy - 1900; t.tm_mon = mo - 1; t.tm_mday = dd;
+                t.tm_hour = hh; t.tm_min = mm; t.tm_sec = ss;
+                time_t incoming = mktime(&t);
+                time_t current  = time(nullptr);
+                setenv("TZ", cfg.tz, 1); tzset();
+                long diff = (long)(incoming - current);
+                if (diff < 0) diff = -diff;
+                if (diff > 60) {
+                    Serial.printf("[RTC] Drift %lds — correcting\n", diff);
+                    setTimeFromSkyper(hh, mm, ss, dd, mo, yy);
+                }
+                return true;
+            }
             setTimeFromSkyper(hh, mm, ss, dd, mo, yy);
             return true;
         }
@@ -214,6 +271,23 @@ bool tryParseSkyperTime(const char* text) {
 // ═══════════════════════════════════════════════════════
 //  CONFIG  (SPIFFS /config.json)
 // ═══════════════════════════════════════════════════════
+
+static void resolveTzAlias() {
+    File f = SPIFFS.open("/tz.csv", "r");
+    if (!f) return;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        int eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        if (line.substring(0, eq) == cfg.tz) {
+            strlcpy(cfg.tz, line.substring(eq + 1).c_str(), sizeof(cfg.tz));
+            f.close();
+            return;
+        }
+    }
+    f.close();
+}
 
 static int langCodeToIdx(const char* c) {
     if (!strcmp(c, "en")) return LANG_EN;
@@ -262,11 +336,14 @@ void loadConfig() {
     cfg.storeMessages = doc["storeMessages"] | false;
     if (doc["messageFolder"].is<const char*>())
         strlcpy(cfg.messageFolder, doc["messageFolder"], sizeof(cfg.messageFolder));
+    if (doc["tz"].is<const char*>())
+        strlcpy(cfg.tz, doc["tz"], sizeof(cfg.tz));
 
     langIdx = langCodeToIdx(cfg.lang);
+    resolveTzAlias();
 
-    Serial.printf("[CFG] lang=%s store=%s folder=%s rics=",
-                  cfg.lang, cfg.storeMessages ? "y" : "n", cfg.messageFolder);
+    Serial.printf("[CFG] lang=%s store=%s folder=%s tz=%s rics=",
+                  cfg.lang, cfg.storeMessages ? "y" : "n", cfg.messageFolder, cfg.tz);
     for (int i = 0; i < cfg.ricCount; i++)
         Serial.printf("%lu%s", cfg.rics[i], i + 1 < cfg.ricCount ? "," : "\n");
 }
@@ -330,7 +407,8 @@ void loadSavedMessages() {
         char     text[MAX_LEN];
         bool     tsIsEpoch;
     };
-    LoadedMsg loaded[MAX_MSGS * 2];
+    // Static: ~8.5 KB pole by preteklo 8 KB stack loopTask-u.
+    static LoadedMsg loaded[MAX_MSGS * 2];
     int loadedCount = 0;
     const int maxLoaded = sizeof(loaded) / sizeof(loaded[0]);
     size_t prefixLen = strlen(cfg.messageFolder);
@@ -431,9 +509,17 @@ void drawMiniBar() {
         snprintf(b, sizeof(b), "%d %s", ur, T(STR_NEW));
         oled.print(b);
     } else {
-        char freq[10];
-        snprintf(freq, sizeof(freq), "%.3f", frequency);  // e.g. "439.988"
-        oled.print(freq);
+        // "439.988 1234567[+]"  — freq + prvy RIC (+ ak ich je viac)
+        char top[24];
+        if (cfg.ricCount > 0) {
+            snprintf(top, sizeof(top), "%.3f %lu%s",
+                     frequency,
+                     (unsigned long)cfg.rics[0],
+                     cfg.ricCount > 1 ? "+" : "");
+        } else {
+            snprintf(top, sizeof(top), "%.3f", frequency);
+        }
+        oled.print(top);
     }
 
     // Battery right side
@@ -465,17 +551,8 @@ void drawIdle() {
         oled.print(F("Waiting for time sync..."));
     }
 
-    // RIC list (up to 3 shown)
-    oled.setCursor(4, 34);
-    oled.print(F("RIC "));
-    for (int i = 0; i < cfg.ricCount && i < 3; i++) {
-        if (i) oled.print(F(","));
-        oled.print(cfg.rics[i]);
-    }
-    if (cfg.ricCount > 3) oled.print(F("+"));
-
-    // Messages summary
-    oled.setCursor(4, 44);
+    // Messages summary (RIC je teraz v hornom mini-bare vedla frekvencie)
+    oled.setCursor(4, 38);
     if (msgCount > 0) {
         oled.print(totalMsgs);
         oled.print(' ');
@@ -499,10 +576,9 @@ void drawIdle() {
     oled.display();
 }
 
-// ── ALERT: BIG message text, thin sender+time header ──
+// ── ALERT: message text + thin sender+time header ──
 void drawAlert(int idx) {
     if (idx >= msgCount) return;
-    oled.clearDisplay();
 
     // Parse sender from message (DAPNET format: "CALL: text")
     char sender[10] = "";
@@ -513,11 +589,31 @@ void drawAlert(int idx) {
         strncpy(sender, inbox[idx].text, slen);
         sender[slen] = '\0';
         body = colon + 1;
-        while (*body == ' ') body++;  // skip space after colon
+        while (*body == ' ') body++;
     }
 
-    // Header: sender left, time right (9px)
-    oled.fillRect(0, 0, 128, 9, SSD1306_WHITE);
+    // Init scroll (skip when called from scroll animation)
+    if (!scrollInProgress) {
+        int cpl = 128 / 12;   // size-2 char = 12px wide → 10 chars/line
+        int lines = ((int)strlen(body) + cpl - 1) / cpl;
+        int textH = lines * 16;  // size-2 char = 16px tall
+        scrollMax = textH > BODY_H ? textH - BODY_H : 0;
+        scrollY = 0;
+        scrollState = 0;
+        scrollTimer = millis();
+    }
+
+    oled.clearDisplay();
+
+    // Body first (may bleed into header area during scroll — header covers it)
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(2);
+    oled.setTextWrap(true);
+    oled.setCursor(0, BODY_TOP - scrollY);
+    oled.print(body);
+
+    // Header on top (covers any body bleed)
+    oled.fillRect(0, 0, 128, BODY_TOP, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
     oled.setTextSize(1);
     oled.setCursor(2, 1);
@@ -528,19 +624,10 @@ void drawAlert(int idx) {
         snprintf(ric, sizeof(ric), "%lu", inbox[idx].addr);
         oled.print(ric);
     }
-
-    // Time on right (wall clock if rtcValid, else "--:--")
     char ts[8];
     formatClock(ts, sizeof(ts));
     oled.setCursor(100, 1);
     oled.print(ts);
-
-    // Message body in BIG font — 55px = 3 lines of size 2
-    oled.setTextColor(SSD1306_WHITE);
-    oled.setTextSize(2);
-    oled.setTextWrap(true);
-    oled.setCursor(0, 14);
-    oled.print(body);
 
     oled.display();
 }
@@ -615,11 +702,10 @@ void drawInbox() {
     oled.display();
 }
 
-// ── DETAIL: full message in BIG font ──
+// ── DETAIL: full message text ──
 void drawDetail(int idx) {
     if (idx >= msgCount) return;
     inbox[idx].unread = false;
-    oled.clearDisplay();
 
     // Parse sender
     char sender[10] = "";
@@ -633,8 +719,28 @@ void drawDetail(int idx) {
         while (*body == ' ') body++;
     }
 
-    // Header: sender + position + age (9px)
-    oled.fillRect(0, 0, 128, 9, SSD1306_WHITE);
+    // Init scroll (skip when called from scroll animation)
+    if (!scrollInProgress) {
+        int cpl = 128 / 12;
+        int lines = ((int)strlen(body) + cpl - 1) / cpl;
+        int textH = lines * 16;
+        scrollMax = textH > BODY_H ? textH - BODY_H : 0;
+        scrollY = 0;
+        scrollState = 0;
+        scrollTimer = millis();
+    }
+
+    oled.clearDisplay();
+
+    // Body first (header covers any bleed)
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(2);
+    oled.setTextWrap(true);
+    oled.setCursor(0, BODY_TOP - scrollY);
+    oled.print(body);
+
+    // Header on top
+    oled.fillRect(0, 0, 128, BODY_TOP, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
     oled.setTextSize(1);
     oled.setCursor(2, 1);
@@ -645,8 +751,6 @@ void drawDetail(int idx) {
         snprintf(ric, sizeof(ric), "%lu", inbox[idx].addr);
         oled.print(ric);
     }
-
-    // Position + age on right
     char info[16];
     char age[8];
     formatAge(inbox[idx].timestamp, inbox[idx].tsIsEpoch, age, sizeof(age));
@@ -654,13 +758,6 @@ void drawDetail(int idx) {
     int iw = strlen(info) * 6;
     oled.setCursor(128 - iw - 2, 1);
     oled.print(info);
-
-    // Message body BIG
-    oled.setTextColor(SSD1306_WHITE);
-    oled.setTextSize(2);
-    oled.setTextWrap(true);
-    oled.setCursor(0, 14);
-    oled.print(body);
 
     oled.display();
 }
@@ -688,8 +785,34 @@ void setup() {
     pinMode(BUZZER, OUTPUT);
     pinMode(BUTTON_USR, INPUT);
     Wire.begin(OLED_SDA, OLED_SCL);
+    Wire.setTimeOut(50);
 
     loadConfig();
+
+    // Obnova casu: ESP32 RTC prezije soft-reset, SPIFFS prezije aj power-off
+    time_t bootTime = time(nullptr);
+    if (bootTime > 1700000000) {
+        setenv("TZ", cfg.tz, 1);
+        tzset();
+        rtcValid = true;
+        Serial.println(F("[RTC] Time survived reset"));
+    } else {
+        File tf = SPIFFS.open("/rtc.txt", "r");
+        if (tf) {
+            time_t saved = (time_t)tf.readStringUntil('\n').toInt();
+            tf.close();
+            if (saved > 1700000000) {
+                struct timeval tv = { .tv_sec = saved, .tv_usec = 0 };
+                settimeofday(&tv, NULL);
+                setenv("TZ", cfg.tz, 1);
+                tzset();
+                rtcValid = true;
+                Serial.printf("[RTC] Restored from SPIFFS: %lu (may be stale)\n",
+                              (unsigned long)saved);
+            }
+        }
+    }
+
     loadSavedMessages();
 
     // PMU
@@ -780,9 +903,24 @@ void setup() {
     delay(100);
     noTone(BUZZER);
 
+    // Spusti POCSAG reception na Core 0 — readData() moze blokovat,
+    // ale UI na Core 1 bezi dalej.
+    rxQueue = xQueueCreate(4, sizeof(RxMsg));
+    xTaskCreatePinnedToCore(rxTask, "rx", 4096, nullptr, 1, nullptr, 0);
+    // WDT: sleduj len Core 1 idle task — Core 0 moze blokovat v readData()
+    esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms    = 5000,
+        .idle_core_mask = (1 << 1),
+        .trigger_panic = true
+    };
+    esp_task_wdt_reconfigure(&wdt_cfg);
+
+    Serial.println(F("[OK] rxTask on Core 0, UI on Core 1"));
+
     updateBattery();
     drawIdle();
     lastActivity = millis();
+    enableLoopWDT();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -796,30 +934,21 @@ void loop() {
     //     lastDbg = millis();
     // }
 
-    // ── POCSAG receive ──
-    if (pager.available() >= 2) {
-        String str;
-        uint32_t addr = 0;
-        int state = pager.readData(str, 0, &addr);
+    // ── POCSAG receive (non-blocking queue from Core 0 rxTask) ──
+    RxMsg rx;
+    while (xQueueReceive(rxQueue, &rx, 0) == pdTRUE) {
+        Serial.printf("\n>>> RIC:%lu | %s\n", rx.addr, rx.text);
 
-        if (state == RADIOLIB_ERR_NONE) {
-            Serial.printf("\n>>> RIC:%lu | %s\n", addr, str.c_str());
-
-            if (addr == TIME_RIC) {
-                // Skyper OTA time broadcast → set clock, no inbox/beep/screen change
-                tryParseSkyperTime(str.c_str());
-                if (rtcValid && screen == SCR_IDLE && oledOn) drawIdle();
-            } else if (addrIsUserRic(addr)) {
-                storeMessage(addr, str.c_str());
-                wakeOLED();
-                Wire.begin(OLED_SDA, OLED_SCL);
-                delay(20);
-                drawAlert(0);
-                beepAlert();
-                lastActivity = millis();
-                screen = SCR_ALERT;
-            }
-            // iné RIC ignorujeme
+        if (rx.addr == TIME_RIC) {
+            tryParseSkyperTime(rx.text);
+            if (rtcValid && screen == SCR_IDLE && oledOn) drawIdle();
+        } else if (addrIsUserRic(rx.addr)) {
+            storeMessage(rx.addr, rx.text);
+            wakeOLED();
+            drawAlert(0);
+            beepAlert();
+            lastActivity = millis();
+            screen = SCR_ALERT;
         }
     }
 
@@ -891,6 +1020,31 @@ void loop() {
     // We reuse: from INBOX, short press opens detail.
     // To move cursor in inbox, we use: from DETAIL, press cycles.
     // Then long press → back to idle.
+
+    // ── Auto-scroll long messages ──
+    if (scrollMax > 0 && (screen == SCR_ALERT || screen == SCR_DETAIL)) {
+        unsigned long now = millis();
+        if (scrollState == 0 && now - scrollTimer >= SCROLL_PAUSE_MS) {
+            scrollState = 1;
+            scrollTimer = now;
+        } else if (scrollState == 1 && now - scrollTimer >= SCROLL_STEP_MS) {
+            scrollY++;
+            scrollTimer = now;
+            if (scrollY >= scrollMax) { scrollState = 2; scrollTimer = now; }
+            scrollInProgress = true;
+            if (screen == SCR_ALERT) drawAlert(0);
+            else                     drawDetail(viewIdx);
+            scrollInProgress = false;
+        } else if (scrollState == 2 && now - scrollTimer >= SCROLL_PAUSE_MS) {
+            scrollY = 0;
+            scrollState = 0;
+            scrollTimer = now;
+            scrollInProgress = true;
+            if (screen == SCR_ALERT) drawAlert(0);
+            else                     drawDetail(viewIdx);
+            scrollInProgress = false;
+        }
+    }
 
     // ── Battery refresh ──
     if (millis() - lastBatUpdate > 30000) {
