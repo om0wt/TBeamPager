@@ -10,7 +10,9 @@ reboots — all without any network connection.
 
 ## Demo
 
-![T-Beam Pager demo](assets/TBeamPager.gif)
+<p align="center">
+  <img src="assets/TBeamPager.gif" alt="T-Beam Pager demo" width="100%">
+</p>
 
 End-to-end walkthrough: Pi-Star POCSAG gateway sends a message, T-Beam
 alerts with sender + body in large font, inbox navigation, detail view
