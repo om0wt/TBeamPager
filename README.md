@@ -8,7 +8,49 @@ the DAPNET frequency, filters on user-assigned RICs, shows arriving messages
 on the built-in OLED, beeps the piezo, and keeps the inbox in SPIFFS across
 reboots — all without any network connection.
 
-Project layout:
+## Demo
+
+<video src="assets/TBeamPager.mp4" controls width="100%" muted playsinline>
+  Your browser does not support the video tag.
+  Watch directly: <a href="assets/TBeamPager.mp4">assets/TBeamPager.mp4</a>
+</video>
+
+> End-to-end walkthrough: Pi-Star POCSAG gateway sends a message, T-Beam
+> alerts with sender + body in large font, inbox navigation, detail view
+> with auto-scroll for long messages.
+
+## Features at a glance
+
+- 📡 **Receives DAPNET POCSAG** on 439.9875 MHz (SX1276 in 2FSK/1200 bps mode) —
+  no WiFi, no internet, no subscription.
+- 🎯 **Multi-RIC filtering** — up to 8 personal RICs configurable via
+  `config.json`, filtered in hardware by the SX1276.
+- ⏰ **Network-delivered RTC** — syncs clock from DAPNET's Skyper OTA Time
+  broadcast (RIC 2504, ~every 5 min). No GPS, no NTP, no RTC chip needed.
+- 💾 **RTC persistence across resets** — saves last sync to SPIFFS; restores
+  on boot. Optional CR1220 coin cell keeps time through full power-off.
+- 🔔 **Big-font alerts + piezo beep** on every personal RIC message; alert
+  screen stays lit until user acknowledges.
+- 📜 **Auto-scroll for long messages** — smooth pixel-by-pixel vertical scroll
+  with pause at top/bottom.
+- 🗂 **Persistent inbox** — last 20 messages kept in SPIFFS across reboots,
+  sorted chronologically by embedded timestamp.
+- 🔌 **Fragment reassembly** — concatenates POCSAG multi-batch fragments
+  from the same RIC within 5 s.
+- 🧠 **Dual-core architecture** — POCSAG reception on Core 0 (may block in
+  RadioLib), UI on Core 1 (always responsive, watchdog-protected).
+- 🌍 **Human-readable timezones** — `"Europe/Bratislava"` resolved from an
+  editable `tz.csv` table (60+ zones, no recompile needed).
+- 🗣 **Multi-language UI** — English, Slovak, French, Spanish, Portuguese.
+- 🔋 **Smart charging + battery UI** — AXP2101 PMU at 500 mA CC, T-Beam
+  TS-pin workaround, per-percent battery indicator.
+- 💤 **OLED auto-blank** after 10 s on idle screen only; inbox/detail stay
+  lit while user browses.
+- 🎛 **Single-button UI** — short/long press state machine across 4 screens.
+- ⚙️ **No binary reflash for config changes** — edit `data/config.json` and
+  re-upload SPIFFS only.
+
+## Project layout
 
 ```
 TBeamPager/
@@ -18,6 +60,7 @@ TBeamPager/
 │       ├── config.json           ← per-device config (SPIFFS)
 │       └── tz.csv                ← timezone alias → POSIX lookup table
 ├── assets/
+│   ├── TBeamPager.mp4            ← demo video
 │   └── screenshots/              ← Pi-Star screenshots used below
 ├── CLAUDE.md                     ← notes for AI pair-programmers
 └── README.md                     ← you are here
@@ -503,8 +546,11 @@ If the gateway logs the message but the T-Beam doesn't beep:
 - **Short-press** on a detail view → cycle to the next message
   (wraps back to the inbox at the end).
 - **Long-press (>0.8 s) anywhere** → back to idle.
-- **60 s of no input** (and no active alert) → OLED blanks to save
-  burn-in; any press or any new message wakes it.
+- **OLED auto-blank** — the display blanks after **10 seconds on the
+  idle screen only**. Inbox, detail, and alert screens stay lit
+  indefinitely while the user browses. A new message alert stays visible
+  until the user acknowledges it with a button press. Any press or new
+  message wakes a blanked display.
 
 ---
 

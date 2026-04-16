@@ -1,9 +1,22 @@
 /*
-  POCSAG Pager — T-Beam v1.2 (AXP2101) — v3
+  DAPNET POCSAG Pager — LilyGO T-Beam v1.2 (AXP2101 + SX1276 + SSD1306)
 
-  Board: ESP32 Dev Module, Upload Speed: 115200, Partition: Default 4MB w/ 1.5MB SPIFFS
-  Libraries: RadioLib, XPowersLib, Adafruit SSD1306, Adafruit GFX, ArduinoJson
-  Filesystem: upload /data via "ESP32 Sketch Data Upload" (SPIFFS)
+  Turns the T-Beam into a standalone POCSAG pager receiver. Listens on
+  439.9875 MHz (IARU R1 DAPNET allocation), filters on configurable RIC
+  addresses, displays messages on the 128×64 OLED, beeps the piezo, and
+  persists the inbox to SPIFFS across reboots.
+
+  Architecture:
+    Core 0 — rxTask: POCSAG reception via RadioLib (may block in readData)
+    Core 1 — loopTask: UI, button handling, battery, OLED (never blocks)
+    Communication: FreeRTOS queue (rxQueue) between cores
+
+  Build (Arduino IDE):
+    Board: ESP32 Dev Module
+    Upload Speed: 115200
+    Partition Scheme: Default 4MB with 1.5MB SPIFFS
+    Libraries: RadioLib, XPowersLib, Adafruit SSD1306, Adafruit GFX, ArduinoJson
+    Two uploads needed: "ESP32 Sketch Data Upload" (SPIFFS) + normal sketch upload
 */
 
 #include <Arduino.h>
@@ -35,17 +48,22 @@
 #define BUTTON_USR  38
 #define BUZZER      25
 
+// DAPNET POCSAG carrier frequency (IARU Region 1). Adjust offset per board
+// to compensate SX1276 crystal error — measure with an SDR if unsure.
 float frequency = 439.98750;
 float offset    = 0.0044;
-#define TIME_RIC    2504       // DAPNET Skyper OTA Time broadcast
 
-// ─── Config (loaded from /config.json on SPIFFS) ────────
+// RIC 2504 = DAPNET "Skyper OTA Time" broadcast, sent every ~5 min.
+// Used as the sole time source — no GPS, no NTP, no WiFi.
+#define TIME_RIC    2504
+
+// ─── Config (loaded from /config.json on SPIFFS at boot) ────
 #define CFG_MAX_RICS 8
 
 struct Config {
     uint32_t rics[CFG_MAX_RICS];
     int      ricCount;
-    char     lang[4];            // "en" | "sk" | "fr" | "es" | "pt"
+    char     lang[4];            // UI language: "en" | "sk" | "fr" | "es" | "pt"
     bool     storeMessages;
     char     messageFolder[24];
     char     tz[48];             // POSIX TZ string, e.g. "CET-1CEST,M3.5.0/2,M10.5.0/3"
@@ -61,21 +79,21 @@ Config cfg = {
 };
 
 // ─── Messages ───────────────────────────────────────────
-#define MAX_MSGS   20
-#define MAX_LEN    200
+#define MAX_MSGS   20          // max messages kept in RAM + SPIFFS
+#define MAX_LEN    200         // max characters per message
 
 struct PagerMsg {
-    uint32_t addr;
-    char     text[MAX_LEN];
-    uint32_t timestamp;      // epoch seconds (wall clock) alebo millis()/1000 uptime
-    bool     tsIsEpoch;      // true → timestamp je reálny čas, false → uptime
-    bool     unread;
+    uint32_t addr;             // sender RIC address
+    char     text[MAX_LEN];    // message body (ASCII-filtered)
+    uint32_t timestamp;        // epoch seconds (wall clock) or millis()/1000 (uptime)
+    bool     tsIsEpoch;        // true = real wall clock, false = uptime since boot
+    bool     unread;           // shown with dot indicator in inbox
 };
 
-PagerMsg inbox[MAX_MSGS];
-int msgCount  = 0;
-int totalMsgs = 0;
-int viewIdx   = 0;
+PagerMsg inbox[MAX_MSGS];      // newest message at index 0 (LIFO)
+int msgCount  = 0;             // number of messages currently in inbox
+int totalMsgs = 0;             // total messages received since boot
+int viewIdx   = 0;             // currently selected message index in inbox UI
 
 // ─── Translations ───────────────────────────────────────
 enum Lang  { LANG_EN, LANG_SK, LANG_FR, LANG_ES, LANG_PT, LANG_COUNT };
@@ -96,30 +114,42 @@ static const char* translations[LANG_COUNT][STR_COUNT] = {
 int langIdx = LANG_EN;
 const char* T(StrId k) { return translations[langIdx][k]; }
 
-// ─── UI ─────────────────────────────────────────────────
+// ─── UI state ───────────────────────────────────────────
+// Four-screen state machine driven by a single button (GPIO 38):
+//   SCR_IDLE   → home screen (clock, RIC, message count, battery)
+//   SCR_ALERT  → newly arrived message in large font (stays lit until user presses)
+//   SCR_INBOX  → scrollable message list with selection highlight
+//   SCR_DETAIL → full message body with sender header and age
 enum Screen { SCR_IDLE, SCR_ALERT, SCR_INBOX, SCR_DETAIL };
 Screen screen = SCR_IDLE;
-unsigned long lastActivity  = 0;
-unsigned long lastBatUpdate = 0;
-unsigned long btnDownTime   = 0;
-bool oledOn = true;
-bool btnWasDown = false;
+unsigned long lastActivity  = 0;   // last user interaction (button press or new message)
+unsigned long lastBatUpdate = 0;   // last battery voltage readout
+unsigned long btnDownTime   = 0;   // millis() when button was pressed down
+bool oledOn = true;                // false = display blanked (just framebuffer, no HW sleep)
+bool btnWasDown = false;           // edge detection for button press/release
 float batVoltage = 0;
 int batPercent   = 0;
-bool rtcValid = false;       // true po prvom Skyper OTA Time sync
+bool rtcValid = false;             // true after first successful Skyper OTA time sync
+
+// Fragment reassembly: RadioLib returns ~50 chars per readData() call.
+// If a second fragment from the same RIC arrives within this window,
+// it's appended to the previous message instead of creating a new one.
 unsigned long lastMsgTime = 0;
 #define FRAG_WINDOW_MS 5000
 
 // ─── Auto-scroll for long messages ─────────────────────
-#define BODY_TOP        10
-#define BODY_H          (64 - BODY_TOP)
-#define SCROLL_STEP_MS  80
-#define SCROLL_PAUSE_MS 2000
-int  scrollY     = 0;
-int  scrollMax   = 0;
-int  scrollState = 0;        // 0=pause_top, 1=scrolling, 2=pause_bottom
+// Messages longer than ~3 lines (30 chars at text size 2) overflow the
+// 128×64 display. The body auto-scrolls: pause at top → pixel scroll
+// → pause at bottom → wrap. Header stays fixed above the scroll area.
+#define BODY_TOP        10         // y-pixel where message body starts (below header)
+#define BODY_H          (64 - BODY_TOP)  // available pixels for body
+#define SCROLL_STEP_MS  80         // ms between 1-pixel scroll steps
+#define SCROLL_PAUSE_MS 2000       // pause at top/bottom before scrolling
+int  scrollY     = 0;              // current vertical scroll offset in pixels
+int  scrollMax   = 0;              // max scroll offset (0 = no scroll needed)
+int  scrollState = 0;              // 0=pause_top, 1=scrolling_down, 2=pause_bottom
 unsigned long scrollTimer = 0;
-bool scrollInProgress = false;
+bool scrollInProgress = false;     // true when called from scroll animation (skip scroll init)
 
 // ─── Objects ────────────────────────────────────────────
 SX1276 radio = new Module(LORA_SS, LORA_DIO0, LORA_RST, LORA_DIO1);
@@ -128,18 +158,25 @@ Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 XPowersAXP2101 pmu;
 
 // ─── Core 0 RX task + queue ────────────────────────────
-struct RxMsg {
-    uint32_t addr;
-    char     text[MAX_LEN];
-};
-QueueHandle_t rxQueue = nullptr;
+// RadioLib's readData() polls DIO2 in a tight loop (PhysicalLayer::read)
+// with NO timeout. When a POCSAG transmission ends mid-frame, it blocks
+// indefinitely. Running this on a dedicated FreeRTOS task pinned to Core 0
+// keeps the UI on Core 1 fully responsive even during a blocked read.
+// The idle task watchdog for Core 0 is disabled so it won't trigger a reset.
 
+struct RxMsg {
+    uint32_t addr;             // decoded RIC address
+    char     text[MAX_LEN];    // decoded message text
+};
+QueueHandle_t rxQueue = nullptr;  // 4-entry queue bridging Core 0 → Core 1
+
+// Runs forever on Core 0. Only touches SPI (SX1276) — never I²C (OLED/PMU).
 void rxTask(void* param) {
     for (;;) {
         if (pager.available() >= 2) {
             String str;
             uint32_t addr = 0;
-            int state = pager.readData(str, 0, &addr);
+            int state = pager.readData(str, 0, &addr);  // may block here!
             if (state == RADIOLIB_ERR_NONE) {
                 RxMsg msg;
                 msg.addr = addr;
@@ -147,7 +184,7 @@ void rxTask(void* param) {
                 xQueueSend(rxQueue, &msg, portMAX_DELAY);
             }
         }
-        vTaskDelay(1);
+        vTaskDelay(1);  // yield to other Core 0 tasks
     }
 }
 
@@ -155,6 +192,9 @@ void rxTask(void* param) {
 //  HELPERS
 // ═══════════════════════════════════════════════════════
 
+// Kill WiFi + Bluetooth and downclock CPU to 80 MHz. This is a pager,
+// never a network device. The extra draw is wasted and WiFi RF can
+// desensitize the SX1276 RX frontend. Called once at the top of setup().
 void disableRadios() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -163,24 +203,29 @@ void disableRadios() {
     setCpuFrequencyMhz(80);
 }
 
+// Blank the OLED framebuffer and push it. No hardware sleep command —
+// the panel stays powered, just shows all-black.
 void sleepOLED() {
     oled.clearDisplay();
-    oled.display();        // just blank the screen
+    oled.display();
     oledOn = false;
 }
 
+// Mark the display as active. The next draw call will show content.
 void wakeOLED() {
-    oledOn = true;         // that's it — display is always on, just blank
+    oledOn = true;
 }
 
+// Read battery voltage + charge state from AXP2101 via I²C.
+// Linear approximation: 3.2V = 0%, 4.15V = 100%.
 void updateBattery() {
     batVoltage = pmu.getBattVoltage() / 1000.0;
     batPercent = constrain((int)((batVoltage - 3.2) / 0.95 * 100), 0, 100);
     lastBatUpdate = millis();
-    
+
     bool isCharging = pmu.isCharging();
     bool usbIn = pmu.isVbusIn();
-    Serial.printf("[BAT] %.2fV (%d%%) USB:%s Charging:%s\n", 
+    Serial.printf("[BAT] %.2fV (%d%%) USB:%s Charging:%s\n",
                   batVoltage, batPercent,
                   usbIn ? "yes" : "no",
                   isCharging ? "yes" : "no");
@@ -193,6 +238,8 @@ int unreadCount() {
     return n;
 }
 
+// Format message age as "Xs ago" / "Xm ago" / "Xh ago".
+// Uses wall clock if the message has a real timestamp, else uptime.
 char* formatAge(uint32_t ts, bool tsIsEpoch, char* buf, int len) {
     uint32_t now = tsIsEpoch ? (uint32_t)time(nullptr) : (uint32_t)(millis() / 1000);
     unsigned long age = (now >= ts) ? (now - ts) : 0;
@@ -213,9 +260,11 @@ void formatClock(char* buf, int len) {
     }
 }
 
-// Set ESP32 system time from Skyper OTA Time broadcast (UTC input).
+// Set ESP32 system clock from a Skyper OTA Time broadcast.
+// Input is UTC; after setting, switches to the user's local timezone
+// (from cfg.tz) and persists the epoch to /rtc.txt on SPIFFS.
 void setTimeFromSkyper(int hh, int mm, int ss, int dd, int mo, int yy) {
-    setenv("TZ", "UTC0", 1);
+    setenv("TZ", "UTC0", 1);  // temporarily UTC for mktime()
     tzset();
     struct tm t = {};
     t.tm_year = 2000 + yy - 1900;
@@ -227,10 +276,11 @@ void setTimeFromSkyper(int hh, int mm, int ss, int dd, int mo, int yy) {
     time_t utc = mktime(&t);
     struct timeval tv = { .tv_sec = utc, .tv_usec = 0 };
     settimeofday(&tv, NULL);
-    // Slovensko: CET (+1) / CEST (+2), auto DST podla POSIX TZ stringu
+    // Switch to local timezone (loaded from config.json, resolved via tz.csv)
     setenv("TZ", cfg.tz, 1);
     tzset();
     rtcValid = true;
+    // Persist to SPIFFS so time survives full power-off (with coin cell backup)
     File tf = SPIFFS.open("/rtc.txt", "w");
     if (tf) { tf.println(utc); tf.close(); }
     Serial.printf("[RTC] Sync: 20%02d-%02d-%02d %02d:%02d:%02d UTC → saved\n",
@@ -238,16 +288,19 @@ void setTimeFromSkyper(int hh, int mm, int ss, int dd, int mo, int yy) {
 }
 
 // Parse "[Skyper OTA Time] HHMMSS DDMMYY" (or bare "HHMMSS DDMMYY").
-// Returns true if matched and clock was set.
+// Returns true if the format matched. Only updates the clock when:
+//   - rtcValid is false (first sync — always apply), or
+//   - the drift between current clock and incoming time exceeds 60 seconds
+// This avoids unnecessary settimeofday() calls on every 5-minute broadcast.
 bool tryParseSkyperTime(const char* text) {
     const char* p = strstr(text, "] ");
-    p = p ? p + 2 : text;
+    p = p ? p + 2 : text;  // skip "[Skyper OTA Time] " prefix if present
     int hh, mm, ss, dd, mo, yy;
     if (sscanf(p, "%2d%2d%2d %2d%2d%2d", &hh, &mm, &ss, &dd, &mo, &yy) == 6) {
         if (hh < 24 && mm < 60 && ss < 60 &&
             dd >= 1 && dd <= 31 && mo >= 1 && mo <= 12) {
             if (rtcValid) {
-                // Porovnaj s aktualnym casom — aktualizuj len ak rozdiel > 60 s
+                // Clock already set — only correct if drift > 60 seconds
                 setenv("TZ", "UTC0", 1); tzset();
                 struct tm t = {};
                 t.tm_year = 2000 + yy - 1900; t.tm_mon = mo - 1; t.tm_mday = dd;
@@ -271,9 +324,13 @@ bool tryParseSkyperTime(const char* text) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  CONFIG  (SPIFFS /config.json)
+//  CONFIG  (SPIFFS /config.json + /tz.csv)
 // ═══════════════════════════════════════════════════════
 
+// Resolve a human-readable timezone alias (e.g. "Europe/Bratislava") to
+// its POSIX TZ string by looking it up in /tz.csv on SPIFFS.
+// Format: one "alias=POSIX" pair per line. If no match, cfg.tz is left
+// unchanged (so raw POSIX strings also work in config.json).
 static void resolveTzAlias() {
     File f = SPIFFS.open("/tz.csv", "r");
     if (!f) return;
@@ -357,10 +414,18 @@ bool addrIsUserRic(uint32_t addr) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  MESSAGE PERSISTENCE  (SPIFFS)
-//  Path:   <folder>/<ric>_<YYYYMMDDHHMMSS>.txt   (ak rtcValid)
-//          <folder>/<ric>_u<uptimeSec>.txt       (fallback pred time sync)
-//  Body:   "<epoch>\t<ric>\t<text>\n"
+//  MESSAGE PERSISTENCE  (SPIFFS flat filesystem)
+//
+//  SPIFFS has no real directories — paths with '/' are just filenames.
+//  Each message is one file:
+//    Path (RTC synced):  <folder>/<ric>_<YYYYMMDDHHMMSS>.txt
+//    Path (pre-sync):    <folder>/<ric>_u<uptimeSec>.txt
+//    Body:               "<epoch>\t<ric>\t<text>\n"
+//
+//  On boot, loadSavedMessages() scans all files, filters by folder
+//  prefix, sorts by the epoch stored inside (not by filename — RIC-first
+//  names don't sort chronologically across multiple RICs), and keeps
+//  the newest MAX_MSGS entries.
 // ═══════════════════════════════════════════════════════
 
 void saveMessageToFS(const PagerMsg& m) {
@@ -378,7 +443,7 @@ void saveMessageToFS(const PagerMsg& m) {
                  cfg.messageFolder, (unsigned long)m.addr,
                  (unsigned long)m.timestamp);
     }
-    // Proti kolizii (dve spravy v rovnakej sekunde) — pridame sufix.
+    // Collision avoidance: two messages in the same second get suffix _a, _b, …
     if (SPIFFS.exists(path)) {
         char suf[4] = "_a";
         size_t baseLen = strlen(path) - 4;  // pred ".txt"
@@ -398,8 +463,8 @@ void saveMessageToFS(const PagerMsg& m) {
 void loadSavedMessages() {
     if (!cfg.storeMessages) return;
 
-    // SPIFFS je flat — iteraciou cez "/" prejdeme vsetky subory, filtrujeme prefix folderu,
-    // a triedime podla timestamp-u z obsahu (nie filename-u, kedze ten zacina RIC).
+    // SPIFFS is flat — iterate root, filter by folder prefix, sort by
+    // embedded timestamp (not filename, since RIC-first names don't sort chronologically).
     File root = SPIFFS.open("/");
     if (!root) return;
 
@@ -409,7 +474,7 @@ void loadSavedMessages() {
         char     text[MAX_LEN];
         bool     tsIsEpoch;
     };
-    // Static: ~8.5 KB pole by preteklo 8 KB stack loopTask-u.
+    // Static: ~8.5 KB array would overflow the 8 KB loopTask stack if local.
     static LoadedMsg loaded[MAX_MSGS * 2];
     int loadedCount = 0;
     const int maxLoaded = sizeof(loaded) / sizeof(loaded[0]);
@@ -444,14 +509,14 @@ void loadSavedMessages() {
         entry = root.openNextFile();
     }
 
-    // Sort vzostupne podla ts (najstarsie prve).
+    // Sort ascending by timestamp (oldest first).
     for (int i = 0; i < loadedCount - 1; i++)
         for (int j = i + 1; j < loadedCount; j++)
             if (loaded[i].ts > loaded[j].ts) {
                 LoadedMsg t = loaded[i]; loaded[i] = loaded[j]; loaded[j] = t;
             }
 
-    // Nacitaj poslednych MAX_MSGS (najnovsie ako posledne → po shift-e konci na inbox[0]).
+    // Keep the newest MAX_MSGS. Each is shift-inserted at inbox[0] (newest first).
     int start = loadedCount > MAX_MSGS ? loadedCount - MAX_MSGS : 0;
     for (int i = start; i < loadedCount; i++) {
         if (msgCount < MAX_MSGS) msgCount++;
@@ -466,12 +531,14 @@ void loadSavedMessages() {
     Serial.printf("[FS] loaded %d messages (%d on disk)\n", msgCount, loadedCount);
 }
 
-// ─── Store message with ASCII filter ────────────────────
+// Store a new message at inbox[0], shifting existing messages down.
+// Non-printable characters are filtered (POCSAG can contain control codes).
 void storeMessage(uint32_t addr, const char* text) {
     if (msgCount < MAX_MSGS) msgCount++;
     for (int i = msgCount - 1; i > 0; i--) inbox[i] = inbox[i - 1];
     inbox[0].addr = addr;
 
+    // ASCII filter: keep printable chars (32–126), replace newlines with spaces
     int j = 0;
     for (int i = 0; text[i] && j < MAX_LEN - 1; i++) {
         char c = text[i];
@@ -498,7 +565,9 @@ void storeMessage(uint32_t addr, const char* text) {
 //  SCREENS
 // ═══════════════════════════════════════════════════════
 
-// ── Tiny status bar (just 8px tall) ──
+// ── Status bar (9px white band at top of screen) ──
+// Shows: frequency + primary RIC (or "N new" when unread), battery % on right.
+// Used by idle and inbox screens; alert/detail have their own headers.
 void drawMiniBar() {
     oled.fillRect(0, 0, 128, 9, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
@@ -511,7 +580,7 @@ void drawMiniBar() {
         snprintf(b, sizeof(b), "%d %s", ur, T(STR_NEW));
         oled.print(b);
     } else {
-        // "439.988 1234567[+]"  — freq + prvy RIC (+ ak ich je viac)
+        // "439.988 1234567[+]" — frequency + primary RIC (+ if more configured)
         char top[24];
         if (cfg.ricCount > 0) {
             snprintf(top, sizeof(top), "%.3f %lu%s",
@@ -553,7 +622,7 @@ void drawIdle() {
         oled.print(F("Waiting for time sync..."));
     }
 
-    // Messages summary (RIC je teraz v hornom mini-bare vedla frekvencie)
+    // Message count summary (RIC moved to status bar)
     oled.setCursor(4, 38);
     if (msgCount > 0) {
         oled.print(totalMsgs);
@@ -791,9 +860,12 @@ void setup() {
 
     loadConfig();
 
-    // Obnova casu: ESP32 RTC prezije soft-reset, SPIFFS prezije aj power-off
+    // RTC recovery (3 sources, checked in order):
+    // 1. ESP32 internal RTC — survives soft resets, stays powered while LiPo connected
+    // 2. SPIFFS /rtc.txt    — survives full power-off if coin cell keeps flash
+    // 3. Skyper OTA          — definitive source, arrives within ~5 min of boot
     time_t bootTime = time(nullptr);
-    if (bootTime > 1700000000) {
+    if (bootTime > 1700000000) {   // already valid (survived soft reset)
         setenv("TZ", cfg.tz, 1);
         tzset();
         rtcValid = true;
@@ -817,7 +889,8 @@ void setup() {
 
     loadSavedMessages();
 
-    // PMU
+    // ── AXP2101 PMU init (order-sensitive — must come before OLED) ──
+    // PMU and OLED share the same I²C bus (SDA 21, SCL 22).
     if (!pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, OLED_SDA, OLED_SCL)) {
         Serial.println(F("[PMU] FATAL!"));
         while (true) delay(1000);
@@ -826,23 +899,24 @@ void setup() {
     pmu.enableALDO2();
     pmu.setDC1Voltage(3300);
     pmu.enableDC1();
-    pmu.disableALDO3();   // GPS off
+    pmu.disableALDO3();   // GPS off — keep NEO-6M unpowered to save ~30 mA
     pmu.disableBLDO1();
     pmu.disableBLDO2();
     pmu.disableDLDO1();
     pmu.disableDLDO2();
 
-    // VBUS input limits — bez toho ostane input ~100 mA a charger ledva tlaci
+    // VBUS input limits — without this, defaults to ~100 mA and charger is starved
     pmu.setVbusVoltageLimit(XPOWERS_AXP2101_VBUS_VOL_LIM_4V36);
     pmu.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_1500MA);
 
-    // Ochrana batérie
+    // Battery protection — shutdown below 2.6V to prevent deep discharge
     pmu.setSysPowerDownVoltage(2600);
 
-    // T-Beam nema NTC na batke — bez tohto ide charger do trickle kvoli "over-temp"
+    // T-Beam has no NTC on the TS pin — without this the AXP2101 reads
+    // out-of-range temp and drops to trickle charge while still reporting isCharging()=true
     pmu.disableTSPinMeasure();
 
-    // ADC kanaly
+    // Enable ADC channels for battery monitoring
     pmu.enableBattDetection();
     pmu.enableBattVoltageMeasure();
     pmu.enableVbusVoltageMeasure();
@@ -878,8 +952,8 @@ void setup() {
         while (true) delay(1000);
     }
 
-    // Prijimame user RIC list z konfiguracie + TIME_RIC (Skyper OTA Time).
-    // RadioLib PagerClient drzi pointery, tak pole musi byt static a zit po celu dobu.
+    // Build RIC filter: user RICs from config + TIME_RIC for clock sync.
+    // Arrays must be static — RadioLib stores pointers, not copies.
     static uint32_t rxAddrs[CFG_MAX_RICS + 1];
     static uint32_t rxMasks[CFG_MAX_RICS + 1];
     int n = 0;
@@ -905,11 +979,12 @@ void setup() {
     delay(100);
     noTone(BUZZER);
 
-    // Spusti POCSAG reception na Core 0 — readData() moze blokovat,
-    // ale UI na Core 1 bezi dalej.
+    // Launch POCSAG reception on Core 0. readData() can block indefinitely
+    // when a transmission ends mid-frame, but the UI on Core 1 stays responsive.
     rxQueue = xQueueCreate(4, sizeof(RxMsg));
     xTaskCreatePinnedToCore(rxTask, "rx", 4096, nullptr, 1, nullptr, 0);
-    // WDT: sleduj len Core 1 idle task — Core 0 moze blokovat v readData()
+    // Reconfigure WDT to only watch Core 1's idle task. Core 0's idle task
+    // won't run while rxTask is blocked in readData() — that's expected.
     esp_task_wdt_config_t wdt_cfg = {
         .timeout_ms    = 5000,
         .idle_core_mask = (1 << 1),
@@ -926,17 +1001,14 @@ void setup() {
 }
 
 // ═══════════════════════════════════════════════════════
-//  LOOP
+//  LOOP  (runs on Core 1 — never blocks, always responsive)
+//
+//  Responsibilities: drain RX queue, handle button, auto-scroll,
+//  battery refresh, OLED auto-blank. ~100 Hz polling rate (delay(10)).
 // ═══════════════════════════════════════════════════════
 
 void loop() {
-    static unsigned long lastDbg = 0;
-    // if (millis() - lastDbg > 500) {
-    //     Serial.printf("BTN38=%d\n", digitalRead(BUTTON_USR));
-    //     lastDbg = millis();
-    // }
-
-    // ── POCSAG receive (non-blocking queue from Core 0 rxTask) ──
+    // ── Drain POCSAG messages from Core 0 queue (non-blocking) ──
     RxMsg rx;
     while (xQueueReceive(rxQueue, &rx, 0) == pdTRUE) {
         Serial.printf("\n>>> RIC:%lu | %s\n", rx.addr, rx.text);
@@ -945,6 +1017,8 @@ void loop() {
             tryParseSkyperTime(rx.text);
             if (rtcValid && screen == SCR_IDLE && oledOn) drawIdle();
         } else if (addrIsUserRic(rx.addr)) {
+            // Fragment reassembly: RadioLib returns ~50 chars per batch.
+            // If same RIC within 5s, append to previous message.
             bool isContinuation = (msgCount > 0 &&
                                    inbox[0].addr == rx.addr &&
                                    millis() - lastMsgTime < FRAG_WINDOW_MS);
@@ -957,7 +1031,7 @@ void loop() {
                 }
             } else {
                 storeMessage(rx.addr, rx.text);
-                beepAlert();
+                beepAlert();  // only beep on first fragment
             }
             lastMsgTime = millis();
             wakeOLED();
@@ -1029,14 +1103,11 @@ void loop() {
         }
     }
 
-    // Scroll inbox with repeated presses when in inbox
-    // (viewIdx changes happen in short press handler above,
-    //  but we need a way to move cursor in inbox list)
-    // We reuse: from INBOX, short press opens detail.
-    // To move cursor in inbox, we use: from DETAIL, press cycles.
-    // Then long press → back to idle.
+    // Navigation model: short press in inbox opens detail; in detail,
+    // short press cycles to next message (wraps to inbox at end).
+    // No dedicated scroll gesture — cursor moves through the cycle.
 
-    // ── Auto-scroll long messages ──
+    // ── Auto-scroll for messages longer than the visible body area ──
     if (scrollMax > 0 && (screen == SCR_ALERT || screen == SCR_DETAIL)) {
         unsigned long now = millis();
         if (scrollState == 0 && now - scrollTimer >= SCROLL_PAUSE_MS) {
@@ -1064,15 +1135,17 @@ void loop() {
     // ── Battery refresh ──
     if (millis() - lastBatUpdate > 30000) {
         updateBattery();
-        if (screen == SCR_IDLE) drawIdle();
+        if (screen == SCR_IDLE && oledOn) drawIdle();
     }
 
-    // ── Auto-sleep OLED after 60s ──
-    if (oledOn && screen != SCR_ALERT &&
-        millis() - lastActivity > 60000) {
-        screen = SCR_IDLE;
+    // ── Auto-blank OLED on idle screen after 10s ──
+    // Only blanks on SCR_IDLE — inbox/detail/alert stay lit indefinitely
+    // so the user can browse without the display timing out.
+    // Alert screen stays lit until user acknowledges with a button press.
+    if (oledOn && screen == SCR_IDLE &&
+        millis() - lastActivity > 10000) {
         sleepOLED();
     }
 
-    delay(10);
+    delay(10);  // ~100 Hz polling rate for button + queue
 }
