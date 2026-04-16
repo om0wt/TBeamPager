@@ -14,3 +14,7 @@ build/
 # Claude — local-only AI collaboration notes, not for public repo
 .claude/
 CLAUDE.md
+
+# Per-device config — contains personal RIC(s). Copy config.json.example
+# to config.json and edit locally; do NOT commit your real RIC.
+ESP32-TBEAM-PAGER/data/config.json

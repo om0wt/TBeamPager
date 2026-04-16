@@ -435,12 +435,17 @@ mount or JSON parse fails.
 3. **Partition Scheme**: *Default 4 MB with 1.5 MB SPIFFS* (required — the
    sketch needs a SPIFFS partition for `config.json` and the inbox).
 4. Install the libraries listed in §2.
-5. **Two-step upload** (both are needed):
+5. **Create your local config**: copy
+   `ESP32-TBEAM-PAGER/data/config.json.example` to
+   `ESP32-TBEAM-PAGER/data/config.json` and edit your personal RIC(s),
+   language and timezone. `config.json` is git-ignored so your RIC is
+   never committed.
+6. **Two-step upload** (both are needed):
    - **Sketch Data Upload** via the *ESP32 Sketch Data Upload* plugin
      (Tools menu). This writes `ESP32-TBEAM-PAGER/data/config.json` into
      the SPIFFS partition.
    - **Sketch Upload** — the usual *Upload* button.
-6. Open Serial Monitor at 115200 baud to see boot log.
+7. Open Serial Monitor at 115200 baud to see boot log.
 
 If you edit `data/config.json` (different RIC, different language,
 enable/disable message storage) you must re-run **Sketch Data Upload** for

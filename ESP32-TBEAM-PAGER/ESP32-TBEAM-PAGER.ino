@@ -69,9 +69,12 @@ struct Config {
     char     tz[48];             // POSIX TZ string, e.g. "CET-1CEST,M3.5.0/2,M10.5.0/3"
 };
 
+// Fallback used only if SPIFFS mount fails or /config.json is missing/malformed.
+// Intentionally empty RIC list — do NOT ship a real RIC here, otherwise a
+// misconfigured unit would pick up another ham's traffic on first boot.
 Config cfg = {
-    .rics          = { 1234567 },
-    .ricCount      = 1,
+    .rics          = { 0 },
+    .ricCount      = 0,
     .lang          = "en",
     .storeMessages = true,
     .messageFolder = "/msgs",
