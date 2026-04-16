@@ -10,14 +10,18 @@ reboots — all without any network connection.
 
 ## Demo
 
-<video src="assets/TBeamPager.mp4" controls width="100%" muted playsinline>
-  Your browser does not support the video tag.
-  Watch directly: <a href="assets/TBeamPager.mp4">assets/TBeamPager.mp4</a>
-</video>
+[![T-Beam Pager demo — click to play](assets/TBeamPager_poster.jpg)](assets/TBeamPager.mp4)
 
-> End-to-end walkthrough: Pi-Star POCSAG gateway sends a message, T-Beam
-> alerts with sender + body in large font, inbox navigation, detail view
-> with auto-scroll for long messages.
+▶ **Click the thumbnail** to download/play [`assets/TBeamPager.mp4`](assets/TBeamPager.mp4)
+(stored via Git LFS). End-to-end walkthrough: Pi-Star POCSAG gateway sends a
+message, T-Beam alerts with sender + body in large font, inbox navigation,
+detail view with auto-scroll for long messages.
+
+> **Note:** GitHub's README renderer strips inline `<video>` HTML for
+> security, and relative MP4 links don't autoplay. For a truly inline
+> player, drag-and-drop the video into a GitHub issue or PR comment to
+> get a `user-attachments` URL — that one *does* render inline and can
+> be pasted into the README.
 
 ## Features at a glance
 
